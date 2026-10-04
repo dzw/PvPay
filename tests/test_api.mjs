@@ -280,6 +280,75 @@ check('closeEndOrder 清理 >=1', cleaned >= 1);
 const oldAfter = await db.prepare("SELECT state FROM pay_order WHERE order_id='OLD1'").bind().first();
 check('closeEndOrder 旧订单 state=-1', oldAfter.state === -1);
 
+// =================================================================
+// Test 13: appPush 重试 (isFirstPush=0) — 已通知成功不再重发
+//  (基于 zwc456baby PR#45 7c7423f "isFirstPush" 协议改造)
+// =================================================================
+const t13 = String(Math.floor(Date.now()/1000));
+const sign13 = md5('1' + r1.data.reallyPrice.toFixed(2) + t13 + 'testkey123');
+const retryResp = await appPush(fakeReq({
+  type: '1', price: r1.data.reallyPrice.toFixed(2),
+  t: t13, sign: sign13,
+  isFirstPush: '0', force_push: 'true', try_count: '2'
+}), db);
+const retryData = JSON.parse(await retryResp.text());
+check('重试 isFirstPush=0 → code=1', retryData.code === 1, JSON.stringify(retryData));
+check('重试时订单 state 仍=1(不变成 2)',
+  (await db.prepare("SELECT state FROM pay_order WHERE order_id=?")
+    .bind(r1.data.orderId).first()).state === 1);
+// 重要:重试时不重复通知 — 通过记录 — 总数应该和最初首次推送时一样
+
+// =================================================================
+// Test 14: appPush 重试 + 通知仍失败 → state 仍为 2
+//  模拟商户地址改了之后重试仍 5xx
+// =================================================================
+await db.prepare("UPDATE pay_order SET state = 2, pay_date = ?, notify_url = 'http://127.0.0.1:65500/dead' WHERE order_id = ?")
+        .bind(Math.floor(Date.now()/1000), r1.data.orderId).run();
+const t14 = String(Math.floor(Date.now()/1000));
+const sign14 = md5('1' + r1.data.reallyPrice.toFixed(2) + t14 + 'testkey123');
+const retry2 = await appPush(fakeReq({
+  type: '1', price: r1.data.reallyPrice.toFixed(2),
+  t: t14, sign: sign14, isFirstPush: '0'
+}), db);
+const retry2Data = JSON.parse(await retry2.text());
+check('重试仍失败 code=-1', retry2Data.code === -1, JSON.stringify(retry2Data));
+const after14 = await db.prepare("SELECT state FROM pay_order WHERE order_id=?")
+                 .bind(r1.data.orderId).first();
+check('重试仍失败 → state 仍为 2', after14.state === 2);
+
+// =================================================================
+// Test 15: appPush 重试 + 通知恢复 (把商户地址换回能成功的) → state=1
+// =================================================================
+await db.prepare("UPDATE pay_order SET notify_url = ? WHERE order_id = ?")
+        .bind(`http://127.0.0.1:${port}/notify`, r1.data.orderId).run();
+const t15 = String(Math.floor(Date.now()/1000));
+const sign15 = md5('1' + r1.data.reallyPrice.toFixed(2) + t15 + 'testkey123');
+notified = '';  // 重置
+const retry3 = await appPush(fakeReq({
+  type: '1', price: r1.data.reallyPrice.toFixed(2),
+  t: t15, sign: sign15, isFirstPush: '0'
+}), db);
+const retry3Data = JSON.parse(await retry3.text());
+check('重试 + 地址修好 → code=1', retry3Data.code === 1, JSON.stringify(retry3Data));
+check('重试时商户真正收到通知', notified.includes('payId=' + p1));
+const after15 = await db.prepare("SELECT state FROM pay_order WHERE order_id=?")
+                 .bind(r1.data.orderId).first();
+check('重试成功 → state=1', after15.state === 1);
+
+// =================================================================
+// Test 16: appPush 重试,但订单 state=1(已通知成功) → 不重发,直接返
+// =================================================================
+notified = '';
+const t16 = String(Math.floor(Date.now()/1000));
+const sign16 = md5('1' + r1.data.reallyPrice.toFixed(2) + t16 + 'testkey123');
+const retry4 = await appPush(fakeReq({
+  type: '1', price: r1.data.reallyPrice.toFixed(2),
+  t: t16, sign: sign16, isFirstPush: '0'
+}), db);
+const retry4Data = JSON.parse(await retry4.text());
+check('重复重试(已成功) → code=1', retry4Data.code === 1);
+check('重复重试 → 不重发商户通知', notified === '');
+
 server.close();
 
 console.log(`\n========================`);

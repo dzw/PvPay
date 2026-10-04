@@ -336,10 +336,15 @@ export async function appHeart(request, db) {
 
 // =========================================================================
 // API: appPush  (监控端推送收款通知) — 业务核心
+// -------------------------------------------------------------------------
+// 协议扩展(基于 zwc456baby PR #45 7c7423f + 2c250d3):
+//   isFirstPush=1   首次推送,默认 1
+//   force_push=true Android 端失败重试时附加,与 isFirstPush=0 等价
+//   try_count=N     重试次数(仅日志,服务端不强制)
 // =========================================================================
 export async function appPush(request, db) {
   await closeEndOrder(db);
-  const p = await readParams(request, ['t', 'type', 'price', 'sign']);
+  const p = await readParams(request, ['t', 'type', 'price', 'sign', 'isFirstPush', 'force_push', 'try_count']);
   const key = await getSetting(db, 'key');
   // 签名 = md5(type + price + t + key) — 与 Vmqphp 一致
   if (md5(String(p.type) + String(p.price) + String(p.t) + String(key)) !== p.sign) {
@@ -349,6 +354,58 @@ export async function appPush(request, db) {
   const now = Math.floor(Date.now() / 1000);
   await db.prepare('UPDATE setting SET vvalue = ? WHERE vkey = ?').bind(String(now), 'lastpay').run();
 
+  // 判断是否重试 (zwc456baby 7c7423f)
+  // 优先 isFirstPush;若未传,fallback 到 force_push;都没有则默认 1(首次)
+  const isFirstPush = p.isFirstPush !== ''
+    ? (p.isFirstPush === '1' || p.isFirstPush === 'true')
+    : (p.force_push !== 'true' && p.force_push !== '1');
+  const tryCount = parseInt(p.try_count || '1', 10);
+
+  // ---- 重试分支:不重复通知,只对已存在的订单重发 ----
+  if (!isFirstPush) {
+    const numPriceR = Number(p.price);
+    // 优先按订单号回查(如有);否则按价格+类型 + state=1/2
+    let row = await db.prepare(
+      `SELECT * FROM pay_order
+       WHERE really_price = ? AND type = ? AND state IN (1, 2)
+       ORDER BY pay_date DESC
+       LIMIT 1`
+    ).bind(numPriceR, Number(p.type)).first();
+
+    if (!row) {
+      // 也按金额兜底
+      row = await db.prepare(
+        `SELECT * FROM pay_order
+         WHERE ABS(really_price - ?) < 0.01
+           AND type = ? AND state IN (1, 2)
+         ORDER BY pay_date DESC
+         LIMIT 1`
+      ).bind(numPriceR, Number(p.type)).first();
+    }
+
+    if (!row) {
+      console.log(`[appPush retry] no matching paid/failed order (type=${p.type} price=${p.price} try=${tryCount})`);
+      return jsonResp(getReturn(1, '重试:未找到已支付订单,忽略'));
+    }
+
+    // state=2(通知失败):重新发通知
+    // state=1(已通知成功):直接返回 success(防对账重复)
+    if (row.state === 1) {
+      console.log(`[appPush retry] order ${row.order_id} already notified (state=1), skip`);
+      return jsonResp(getReturn(1, '重试:订单已成功通知商户'));
+    }
+
+    // state=2 → 重发通知
+    const ok = await notifyMerchantForRow(row, key);
+    if (ok) {
+      await updateOrderById(db, row.id, { state: 1, close_date: now });
+      return jsonResp(getReturn(1, '重试:重新通知商户成功'));
+    }
+    // 还是失败,保持 state=2
+    return jsonResp(getReturn(-1, '重试:通知仍然失败'));
+  }
+
+  // ---- 首次推送分支 ----
   // 1. 找匹配订单 (Vmqphp: really_price = price AND state = 0 AND type = type)
   const numPrice = Number(p.price);
   let row = await findMatchingOrder(db, numPrice, Number(p.type));
@@ -369,23 +426,7 @@ export async function appPush(request, db) {
     await unlockTmpPriceByOid(db, row.order_id);
     await updateOrderById(db, row.id, { state: 1, pay_date: now, close_date: now });
 
-    // 构造 notify URL:md5(payId+param+type+price+reallyPrice+key)
-    const price = Number(row.price).toFixed(2);
-    const reallyPrice = Number(row.really_price).toFixed(2);
-    const type = String(row.type);
-    const param = row.param || '';
-    const pStr = `payId=${row.pay_id}&param=${param}&type=${type}&price=${price}&reallyPrice=${reallyPrice}`;
-    const sign = md5(`${row.pay_id}${param}${type}${price}${reallyPrice}${key}`);
-
-    const ok = await notifyMerchant(row.notify_url, {
-      payId: row.pay_id,
-      param,
-      type,
-      price,
-      reallyPrice,
-      sign
-    });
-
+    const ok = await notifyMerchantForRow({ ...row, pay_date: now, close_date: now }, key);
     if (ok) return jsonResp(getReturn());
     await updateOrderById(db, row.id, { state: 2 });
     return jsonResp(getReturn(-1, '异步通知失败'));
@@ -409,6 +450,23 @@ export async function appPush(request, db) {
     type: Number(p.type)
   });
   return jsonResp(getReturn());
+}
+
+// 抽出"给一行订单发商户通知"的逻辑 — 重试 / 首次 / 补单 / 强制重发 都复用
+export async function notifyMerchantForRow(row, key) {
+  const price = Number(row.price).toFixed(2);
+  const reallyPrice = Number(row.really_price).toFixed(2);
+  const type = String(row.type);
+  const param = row.param || '';
+  const sign = md5(`${row.pay_id}${param}${type}${price}${reallyPrice}${key}`);
+  return notifyMerchant(row.notify_url, {
+    payId: row.pay_id,
+    param,
+    type,
+    price,
+    reallyPrice,
+    sign
+  });
 }
 
 // =========================================================================

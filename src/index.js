@@ -15,7 +15,7 @@ import {
 import {
   adminLoginPage, adminLogin, adminLogout, adminHome,
   adminSettingPage, adminSettingSave,
-  adminOrderList, adminPatchOrder,
+  adminOrderList, adminPatchOrder, adminResendNotify,
   adminQrcodePage, adminQrcodeAdd, adminQrcodeDelete,
   adminApiPage
 } from './admin.js';
@@ -95,6 +95,7 @@ export default {
 
       if (path === '/admin/order') return await adminOrderList(request, db);
       if (path === '/admin/api/patch') return await adminPatchOrder(request, db);
+      if (path === '/admin/api/resend') return await adminResendNotify(request, db);
 
       if (path === '/admin/qrcode' && request.method === 'GET') return await adminQrcodePage(request, db);
       if (path === '/admin/qrcode/add')  return await adminQrcodeAdd(request, db);

@@ -15,6 +15,7 @@ import {
   getReturn
 } from './db.js';
 import { html, escape as e } from './templates.js';
+import { notifyMerchantForRow } from './api.js';
 
 // ----- cookie 鉴权 -----
 // 形如 "admin=<hmac>; Max-Age=86400; Path=/; HttpOnly; SameSite=Lax"
@@ -176,6 +177,9 @@ export async function adminOrderList(request, db) {
 }
 
 // 手动补单 (GET /admin/api/补单?orderId=xxx)
+// Mr-Tony505 (7a5a463) + JooYoo (06d09ec) 的"补单接口"整合:
+//   - 原 state=0/-1:直接置 state=1
+//   - 若原 state=2(通知失败):补单时**主动重发通知商户**,避免人工介入
 export async function adminPatchOrder(request, db) {
   if (!(await checkAuth(request, db))) return redirectLogin();
   const url = new URL(request.url);
@@ -187,11 +191,43 @@ export async function adminPatchOrder(request, db) {
   if (!row) return new Response('订单不存在', { status: 404 });
 
   const now = Math.floor(Date.now() / 1000);
+  const key = await getSetting(db, 'key');
+  const wasFailed = row.state === 2;
+
   await updateOrderState(db, orderId, { state: 1, pay_date: now, close_date: now });
+
+  let resent = 'no';
+  if (wasFailed && row.notify_url) {
+    const refreshed = await findOrderByOrderId(db, orderId);
+    const ok = await notifyMerchantForRow(refreshed, key);
+    resent = ok ? 'ok' : 'fail';
+    if (!ok) {
+      // 通知仍失败:回退 state=2 便于继续 retry
+      await updateOrderState(db, orderId, { state: 2 });
+    }
+  }
   return new Response(null, {
     status: 302,
-    headers: { 'Location': '/admin/order?ok=1' }
+    headers: { 'Location': `/admin/order?ok=1&resent=${resent}` }
   });
+}
+
+// 强制重发通知 (GET /admin/api/resend?orderId=xxx)
+// 不改 state,纯发一次通知;state=1/2 都可调用,适合"商户回调地址临时改"等场景
+export async function adminResendNotify(request, db) {
+  if (!(await checkAuth(request, db))) return redirectLogin();
+  const url = new URL(request.url);
+  const orderId = url.searchParams.get('orderId');
+  if (!orderId) return new Response('missing orderId', { status: 400 });
+  const row = await findOrderByOrderId(db, orderId);
+  if (!row) return new Response('订单不存在', { status: 404 });
+
+  const key = await getSetting(db, 'key');
+  const ok = await notifyMerchantForRow(row, key);
+  return new Response(
+    JSON.stringify(getReturn(ok ? 1 : -1, ok ? '通知发送成功' : '通知发送失败', { orderId, ok })),
+    { headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+  );
 }
 
 // ----- 后台:微信/支付宝固定金额二维码管理 -----
