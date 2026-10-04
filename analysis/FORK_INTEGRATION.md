@@ -174,3 +174,103 @@ POST /appPush
   - `updateOrderById` 已存在,无需新增
 - `tests/test_api.mjs`
   - 补 4 条新测试:重试不重复通知 / 重试 state=2 重发 / 补单重发 / 强制重发
+---
+
+# 第二轮:现存活跃 fork 逐个代码比对(2026-10-04)
+
+> 数据源:`https://github.com/zwc456baby/vmqApk/network` 截图中 11 个在线 fork。
+> 方法:`vmqApk-ref` 本地 fetch 全部 fork 分支,与 `origin/master`(1d8158e)做 merge-base diff,拿到的是**真实代码**而非 commit 消息推测。
+
+## 一、总览
+
+| Fork | 独有提交 | 实质内容 | 对 PvPay 价值 |
+|------|---------|---------|--------------|
+| **altmanlib/vmq-apk** | 50(独立历史) | **Kotlin 全量重写**(MVVM+协程+单测),HMAC-SHA256 签名 JSON 协议、支付回调指数退避重试 | ★★★ 已整合为服务端 `/api/v1/*` |
+| **daojiAnime** | 4 | **多应用 app_id 协议**:二维码 `url/key/app_id`,心跳/推送带 `&app_id=`;host 支持完整 URL | ★★ 服务端接受 app_id(上轮 WIP)+ 客户端已并入 vmqApk-ref WIP |
+| **xinyin025**(=hulisang) | 7 | 路由改名 `/api/monitor/heart` `/api/monitor/push`;UI 美化+主页日志框+收款 toast+CI | ★ 服务端已加路由别名 |
+| **BUGJI** | 3 | 新版支付宝/微信通知解析(合并 title+content 判关键词、`findMoney` 优先 "X元" 模式防广告数字);移除 support 库 | 客户端,可并入自维护 APK |
+| **jiaobotao** | 20 | 支付宝金额优先从标题匹配、bigText 兜底;`usesCleartextTraffic`;Gradle 7.5/AGP 7.2.2(JDK17);CI 自动发 Release;修复上游支付宝 if 缺右括号编译错误 | 客户端构建/识别改进 |
+| **FantajiNeko** | 5 | http→https 硬编码、SDK 升级、CI | 客户端小改 |
+| **drainlin** | 4 | 仅 JDK18 编译配置 | 无 |
+| **xytxg** | 0 | 纯落后,无独有提交 | 无 |
+| **laojichao** | 1 | 仅加 CLAUDE.md 文档 | 无 |
+| **gldden** | - | 账号/仓库已 404 | 无 |
+
+> hulisang 与 xinyin025 提交完全相同(hulisang 是二级 fork)。
+
+## 二、altmanlib HMAC 签名协议(本轮重点整合)
+
+客户端 `RequestSignature.kt`:
+
+```
+canonical = "VMQ-HMAC-SHA256-V1\n{METHOD}\n{pathname}\n{timestamp}\n{nonce}\n{sha256hex(body)}"
+X-VMQ-Signature = "v1=" + hex(HMAC-SHA256(key, canonical))
+```
+
+- `POST /api/v1/system/heartbeat` body `{}`;`POST /api/v1/payments/notify` body `{"channel":1|2,"price":12.34}`
+- 时间戳**秒级**(其修复 `46729db` 专门把毫秒改秒)
+- 客户端重试:`Retry.kt` 指数退避 4 次(1s/2s/4s,上限 10s),**仅 5xx 与 IO 异常可重试**,callTimeout 5s、整体 deadline 30s
+- 服务端策略:校验失败 401(客户端不重试)、内部错误 500(客户端重试);重试不会重复通知商户——`processAppPush` 对 state=1 订单直接返回成功
+
+## 三、本轮服务端代码改动索引
+
+- `src/api.js`
+  - **修复 TDZ bug**:app_id 日志分支引用了后声明的 `isFirstPush`/`tryCount`,带 app_id 的推送必 500
+  - 抽取 `processAppPush()` / `recordHeartbeat()`,md5 协议与 HMAC JSON 协议共用
+  - **修复浮点容差**:`ABS(really_price-?)<0.01` 因 IEEE754 误差会把相邻 1 分钱订单(8.01↔8.00)误匹配,收紧为 `<0.005`
+  - **`notifyMerchant` 空/非法 notify_url 不再抛异常**,按通知失败处理(state=2)
+- `src/api_v1.js`(新增):HMAC-SHA256 校验(WebCrypto)+ 时间戳容差 ±300s + nonce 防重放
+- `src/index.js`:`/api/monitor/heart|push` 别名 + `/api/v1/*` 路由
+- `tests/test_api_v1.mjs`(新增 15 条):正常/缺头/错钥/过期/重放/篡改/参数校验/路由别名
+- `src/templates.js`:后台 API 文档补 ⑧⑨ 两节
+
+## 四、客户端(vmQApk)侧建议并入自维护分支
+
+| 来源 | 改动 | 说明 |
+|------|------|------|
+| BUGJI `180dd87` | title+content 合并判断 + `findMoney` 优先 "X元" | 抗广告数字误识别 |
+| jiaobotao `5b52dab` | 支付宝金额优先从标题匹配 | 与 BUGJI 同题,实现略异 |
+| jiaobotao `3f190e6` | 上游支付宝分支缺右括号修复 | 上游 master 编译不过 |
+| jiaobotao `24eaf90` | Gradle 7.5 / AGP 7.2.2 | JDK17 可构建 |
+| FantajiNeko `ed8b5cd` | https 支持 | 与 daojiAnime 完整 URL host 方案二选一,后者更灵活 |
+
+---
+
+# 第三轮:全量 fetch 12 源 + v2 签名协议合入(2026-10-04)
+
+> 12 个 fork 全部配置为 `vmqApk-ref` 的 git remote(`f-<owner>`),fetch 全部分支后逐分支对比。
+> 勘误:图中 "gldden" 实为 **gdlden**(上次拼写查询 404)。gdlden/vmqApk 19 个提交全是 CI 脚本,**Java 源码零改动**,无需整合。
+
+## 新发现的分支(第二轮只看默认分支,漏掉)
+
+| 分支 | 内容 | 处置 |
+|------|------|------|
+| **hulisang/material-you-style** | **v2 监控端签名**(MonitorSign.java,HMAC-SHA256 替换 md5,毫秒时间戳、BigDecimal 金额定标、黄金向量单测)+ envelope code 校验 + retry_after_millis | ✅ 本轮合入(服务端验签 + 客户端签名) |
+| hulisang/multiuser | `/api/v2/monitor/*` + `&appid=`,面向作者 Go 后端 (vmqfox) | ❌ 不合:与 daojiAnime app_id、altmanlib /api/v1 功能重复 |
+| xytxg/refactor/android-modernization | PaymentParser 防误识别(退款/提现/双重金额过滤)、凭据排除云备份、ApiClient 不回显服务端内容 | ✅ 移植 PaymentFilter 守卫 + backup 排除规则 |
+
+## v2 签名协议(已实现)
+
+```
+heartbeat: sign = HMAC-SHA256(key, "t=" + t毫秒)
+push:      sign = HMAC-SHA256(key, "type=" + type + "&price=" + price + "&t=" + t毫秒)
+```
+- sign 64 位小写 hex;服务端按长度自动区分 md5(32) / v2(64),旧客户端零影响
+- 毫秒时间戳双向新鲜度窗口 ±300s
+- price 文本必须与签名文本一致(客户端 `MonitorSign.priceText` 定标两位)
+
+## 服务端改动(PvPay)
+
+- `src/hmac.js`(新):sha256Hex / hmacSha256Hex / 恒时比较,api.js 与 api_v1.js 共用
+- `src/api.js`:新增 `verifyMonitorSignV2()`;appHeart/appPush 双格式验签(md5 || v2)
+- `tests/test_sign_v2.mjs`(新 12 条):含 Java 客户端黄金向量互验、窗口边界、篡改拒绝
+- `src/templates.js`:后台文档补 ⑧b 节
+
+## 客户端改动(vmqApk-ref)
+
+- 新增 `MonitorSign.java` + `MonitorSignTest.java`(黄金向量,原样取自 hulisang v2 提交)
+- `MainActivity.java` / `NeNotificationService2.java`:心跳×4 + 推送×1 全部改用 MonitorSign;删除两处内联 md5 方法与无用 import;appPush 金额统一 `priceText` 定标
+- 新增 `PaymentFilter.java`(xytxg 规则:退款/退还/失败/提现/转出/支出/待收款/汇总/合计 拒绝、金额 (0, 999999999.99]、文本 ≤8KB),挂在支付宝/微信两个 appPush 前
+- `AndroidManifest.xml` + `res/xml/backup_rules.xml` / `data_extraction_rules.xml`:sharedpref(含 host/key/app_id)排除云备份与换机迁移
+- 已验证:MonitorSign 与服务端黄金向量逐字节一致;PaymentFilter 11 条行为用例全过
+- 未做:xytxg 整库重构(包结构大改,与 WIP 冲突面太大,只取规则);jiaobotao Gradle 升级(其修复针对 v1.8.1 老基线,当前 master 无该编译错误)

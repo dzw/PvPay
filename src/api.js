@@ -20,12 +20,13 @@
 // =============================================================================
 
 import md5 from './md5.js';
+import { isHex, hmacSha256Hex, timingSafeEqualHex } from './hmac.js';
 import {
   getSetting, findOrderByPayId, findOrderByOrderId, findMatchingOrder,
   insertOrder, updateOrderById, updateOrderState,
   closeExpiredOrders, getCloseMinutes,
   tryLockTmpPrice, unlockTmpPriceByOid, cleanOrphanTmpPrices,
-  findPayQrcode, getReturn
+  findPayQrcode, getReturn, recordPayLog
 } from './db.js';
 
 // =========================================================================
@@ -59,7 +60,13 @@ async function readParams(request, names) {
 // 异步通知商户 (Vmqphp getCurl, GET 请求,期望返回 "success")
 async function notifyMerchant(notifyUrl, params) {
   // 拼接参数到 URL (Vmqphp 是 GET 形式)
-  const url = new URL(notifyUrl);
+  let url;
+  try {
+    url = new URL(notifyUrl);
+  } catch (_) {
+    console.error('notifyMerchant: invalid notify_url', JSON.stringify(notifyUrl));
+    return false;
+  }
   for (const [k, v] of Object.entries(params)) {
     url.searchParams.set(k, v);
   }
@@ -319,19 +326,44 @@ export async function getState(request, db) {
 }
 
 // =========================================================================
+// v2 监控端签名 (hulisang/material-you-style 249668c, 客户端 MonitorSign.java)
+//   heartbeat: HMAC-SHA256(key, "t=" + t)
+//   push:      HMAC-SHA256(key, "type=" + type + "&price=" + price + "&t=" + t)
+//   sign 为 64 位小写 hex;t 为毫秒,双向新鲜度窗口 ±300s
+//   32 位 hex 视为旧版 md5 签名,由调用方先行比对
+// =========================================================================
+const V2_TS_TOLERANCE_MS = 300 * 1000;
+
+export async function verifyMonitorSignV2(canonical, tMsStr, key, sign) {
+  if (!isHex(sign, 64)) return false;
+  const tMs = Number(tMsStr);
+  if (!Number.isFinite(tMs) || Math.abs(Date.now() - tMs) > V2_TS_TOLERANCE_MS) return false;
+  return timingSafeEqualHex(await hmacSha256Hex(key, canonical), sign);
+}
+
+// =========================================================================
 // API: appHeart  (监控端心跳)
 // =========================================================================
 export async function appHeart(request, db) {
   await closeEndOrder(db);
-  const p = await readParams(request, ['t', 'sign']);
+  const p = await readParams(request, ['t', 'sign', 'app_id']);
   const key = await getSetting(db, 'key');
-  if (md5(String(p.t) + String(key)) !== p.sign) {
+  if (md5(String(p.t) + String(key)) !== p.sign &&
+      !(await verifyMonitorSignV2(`t=${p.t}`, p.t, key, p.sign))) {
     return jsonResp(getReturn(-1, '签名校验不通过'));
   }
+  await recordHeartbeat(db);
+  if (p.app_id) {
+    console.log(`[appHeart] from app_id=${p.app_id}`);
+  }
+  return jsonResp(getReturn());
+}
+
+// 心跳落库 (md5 协议与 altmanlib HMAC JSON 协议共用)
+export async function recordHeartbeat(db) {
   const now = Math.floor(Date.now() / 1000);
   await db.prepare('UPDATE setting SET vvalue = ? WHERE vkey = ?').bind(String(now), 'lastheart').run();
   await db.prepare('UPDATE setting SET vvalue = ? WHERE vkey = ?').bind('1', 'jkstate').run();
-  return jsonResp(getReturn());
 }
 
 // =========================================================================
@@ -344,15 +376,14 @@ export async function appHeart(request, db) {
 // =========================================================================
 export async function appPush(request, db) {
   await closeEndOrder(db);
-  const p = await readParams(request, ['t', 'type', 'price', 'sign', 'isFirstPush', 'force_push', 'try_count']);
+  const p = await readParams(request, ['t', 'type', 'price', 'sign', 'isFirstPush', 'force_push', 'try_count', 'app_id']);
   const key = await getSetting(db, 'key');
-  // 签名 = md5(type + price + t + key) — 与 Vmqphp 一致
-  if (md5(String(p.type) + String(p.price) + String(p.t) + String(key)) !== p.sign) {
+  // 签名 = md5(type + price + t + key) 或 v2 HMAC-SHA256(key, "type=..&price=..&t=..")
+  if (md5(String(p.type) + String(p.price) + String(p.t) + String(key)) !== p.sign &&
+      !(await verifyMonitorSignV2(
+        `type=${p.type}&price=${p.price}&t=${p.t}`, p.t, key, p.sign))) {
     return new Response('sign error', { status: 200 });
   }
-
-  const now = Math.floor(Date.now() / 1000);
-  await db.prepare('UPDATE setting SET vvalue = ? WHERE vkey = ?').bind(String(now), 'lastpay').run();
 
   // 判断是否重试 (zwc456baby 7c7423f)
   // 优先 isFirstPush;若未传,fallback 到 force_push;都没有则默认 1(首次)
@@ -361,75 +392,121 @@ export async function appPush(request, db) {
     : (p.force_push !== 'true' && p.force_push !== '1');
   const tryCount = parseInt(p.try_count || '1', 10);
 
+  return jsonResp(await processAppPush(db, {
+    type: Number(p.type), price: Number(p.price),
+    isFirstPush, tryCount, appId: p.app_id
+  }));
+}
+
+// =========================================================================
+// processAppPush — 推送业务核心 (md5 协议与 altmanlib HMAC JSON 协议共用)
+// 签名校验由调用方完成,这里只做订单匹配 / 状态流转 / 商户通知
+// setting.paylog = '1' 时把每笔推送记入 pay_log (后台「收款日志」页查看)
+// =========================================================================
+export async function processAppPush(db, params) {
+  const ret = await processAppPushCore(db, params);
+  try {
+    if (String(await getSetting(db, 'paylog')) === '1') {
+      // 回填匹配订单号:取最近一笔同额同类型且已支付/通知失败的订单
+      let orderId = '';
+      const row = await db.prepare(
+        `SELECT order_id FROM pay_order
+         WHERE type = ? AND state IN (1, 2) AND ABS(really_price - ?) < 0.005
+         ORDER BY pay_date DESC, id DESC
+         LIMIT 1`
+      ).bind(params.type, params.price).first();
+      if (row) orderId = row.order_id;
+      await recordPayLog(db, {
+        type: params.type, price: params.price, appId: params.appId,
+        isRetry: !params.isFirstPush, tryCount: params.tryCount,
+        orderId, code: ret.code, msg: ret.msg
+      });
+    }
+  } catch (e) {
+    console.error('paylog error:', e.message);  // 日志失败不影响收款主流程
+  }
+  return ret;
+}
+
+async function processAppPushCore(db, { type, price, isFirstPush, tryCount = 1, appId = '' }) {
+  const now = Math.floor(Date.now() / 1000);
+  await db.prepare('UPDATE setting SET vvalue = ? WHERE vkey = ?').bind(String(now), 'lastpay').run();
+
+  if (appId) {
+    console.log(`[appPush] type=${type} price=${price} isFirstPush=${isFirstPush ? '1' : '0'} try=${tryCount} app_id=${appId}`);
+  }
+
   // ---- 重试分支:不重复通知,只对已存在的订单重发 ----
   if (!isFirstPush) {
-    const numPriceR = Number(p.price);
+    const numPriceR = price;
     // 优先按订单号回查(如有);否则按价格+类型 + state=1/2
     let row = await db.prepare(
       `SELECT * FROM pay_order
        WHERE really_price = ? AND type = ? AND state IN (1, 2)
        ORDER BY pay_date DESC
        LIMIT 1`
-    ).bind(numPriceR, Number(p.type)).first();
+    ).bind(numPriceR, type).first();
 
     if (!row) {
       // 也按金额兜底
       row = await db.prepare(
         `SELECT * FROM pay_order
-         WHERE ABS(really_price - ?) < 0.01
+         WHERE ABS(really_price - ?) < 0.005
            AND type = ? AND state IN (1, 2)
          ORDER BY pay_date DESC
          LIMIT 1`
-      ).bind(numPriceR, Number(p.type)).first();
+      ).bind(numPriceR, type).first();
     }
 
     if (!row) {
-      console.log(`[appPush retry] no matching paid/failed order (type=${p.type} price=${p.price} try=${tryCount})`);
-      return jsonResp(getReturn(1, '重试:未找到已支付订单,忽略'));
+      console.log(`[appPush retry] no matching paid/failed order (type=${type} price=${price} try=${tryCount})`);
+      return getReturn(1, '重试:未找到已支付订单,忽略');
     }
 
     // state=2(通知失败):重新发通知
     // state=1(已通知成功):直接返回 success(防对账重复)
     if (row.state === 1) {
       console.log(`[appPush retry] order ${row.order_id} already notified (state=1), skip`);
-      return jsonResp(getReturn(1, '重试:订单已成功通知商户'));
+      return getReturn(1, '重试:订单已成功通知商户');
     }
 
     // state=2 → 重发通知
+    const key = await getSetting(db, 'key');
     const ok = await notifyMerchantForRow(row, key);
     if (ok) {
       await updateOrderById(db, row.id, { state: 1, close_date: now });
-      return jsonResp(getReturn(1, '重试:重新通知商户成功'));
+      return getReturn(1, '重试:重新通知商户成功');
     }
     // 还是失败,保持 state=2
-    return jsonResp(getReturn(-1, '重试:通知仍然失败'));
+    return getReturn(-1, '重试:通知仍然失败');
   }
 
   // ---- 首次推送分支 ----
   // 1. 找匹配订单 (Vmqphp: really_price = price AND state = 0 AND type = type)
-  const numPrice = Number(p.price);
-  let row = await findMatchingOrder(db, numPrice, Number(p.type));
+  const numPrice = price;
+  let row = await findMatchingOrder(db, numPrice, type);
 
   // 2. 微小差异兜底 (README FAQ Q4:OCR 出来的可能是 "0.02" 但库里 "0.0200000001")
   if (!row) {
     row = await db.prepare(
       `SELECT * FROM pay_order
-       WHERE ABS(really_price - ?) < 0.01
+       WHERE ABS(really_price - ?) < 0.005
          AND type = ? AND state = 0
        ORDER BY create_date ASC
        LIMIT 1`
-    ).bind(numPrice, Number(p.type)).first();
+    ).bind(numPrice, type).first();
   }
 
+  const key = await getSetting(db, 'key');
   if (row) {
     // 解锁 tmp_price,标记已支付
     await unlockTmpPriceByOid(db, row.order_id);
     await updateOrderById(db, row.id, { state: 1, pay_date: now, close_date: now });
 
     const ok = await notifyMerchantForRow({ ...row, pay_date: now, close_date: now }, key);
-    if (ok) return jsonResp(getReturn());
+    if (ok) return getReturn();
     await updateOrderById(db, row.id, { state: 2 });
-    return jsonResp(getReturn(-1, '异步通知失败'));
+    return getReturn(-1, '异步通知失败');
   }
 
   // 3. 没有匹配订单:记一笔 "无订单转账"
@@ -447,9 +524,9 @@ export async function appPush(request, db) {
     really_price: numPrice,
     return_url: '',
     state: 1,
-    type: Number(p.type)
+    type: type
   });
-  return jsonResp(getReturn());
+  return getReturn();
 }
 
 // 抽出"给一行订单发商户通知"的逻辑 — 重试 / 首次 / 补单 / 强制重发 都复用

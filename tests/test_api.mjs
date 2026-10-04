@@ -349,6 +349,36 @@ const retry4Data = JSON.parse(await retry4.text());
 check('重复重试(已成功) → code=1', retry4Data.code === 1);
 check('重复重试 → 不重发商户通知', notified === '');
 
+// =================================================================
+// Test 17: app_id 参数(daojiAnime 9ec0ed7) — 不参与签名,服务端可忽略
+// =================================================================
+const t17 = String(Math.floor(Date.now()/1000));
+const sign17 = md5(String(t17) + 'testkey123');
+const heartWithAid = await appHeart(fakeReq({
+  t: t17, sign: sign17, app_id: 'my-android-app-v2'
+}), db);
+const aidData = JSON.parse(await heartWithAid.text());
+check('appHeart 带 app_id 仍成功', aidData.code === 1, JSON.stringify(aidData));
+
+// 即使 app_id 是错的,只要签名对,就通过(签名不含 app_id)
+const t17b = String(Math.floor(Date.now()/1000));
+const sign17b = md5(String(t17b) + 'testkey123');
+const heartWithBadAid = await appHeart(fakeReq({
+  t: t17b, sign: sign17b, app_id: 'WRONG!!!'
+}), db);
+check('appHeart 带错误 app_id 仍成功(不参与签名)',
+  (JSON.parse(await heartWithBadAid.text())).code === 1);
+
+// appPush 也接受 app_id
+const t17c = String(Math.floor(Date.now()/1000));
+const sign17c = md5('1' + r1.data.reallyPrice.toFixed(2) + t17c + 'testkey123');
+const pushWithAid = await appPush(fakeReq({
+  type: '1', price: r1.data.reallyPrice.toFixed(2),
+  t: t17c, sign: sign17c, app_id: 'android-test'
+}), db);
+check('appPush 带 app_id 仍 code=1',
+  (JSON.parse(await pushWithAid.text())).code === 1);
+
 server.close();
 
 console.log(`\n========================`);

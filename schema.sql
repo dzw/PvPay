@@ -46,6 +46,21 @@ CREATE TABLE IF NOT EXISTS tmp_price (
     oid     TEXT NOT NULL
 );
 
+-- 收款推送日志 (每次 appPush 落一条,受 setting.paylog 开关控制,自动保留最近 1000 条)
+CREATE TABLE IF NOT EXISTS pay_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    create_date INTEGER NOT NULL DEFAULT 0,
+    type        INTEGER NOT NULL DEFAULT 0,   -- 1=微信 2=支付宝
+    price       REAL NOT NULL DEFAULT 0,
+    app_id      TEXT,
+    is_retry    INTEGER NOT NULL DEFAULT 0,   -- 1=监控端失败重试(force_push)
+    try_count   INTEGER NOT NULL DEFAULT 1,
+    order_id    TEXT,                         -- 匹配到的订单号(近似:最近一笔同额同类型)
+    code        INTEGER NOT NULL DEFAULT 0,   -- 处理结果 getReturn.code (1=成功)
+    msg         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pay_log_time ON pay_log(create_date DESC);
+
 -- ============================================================
 -- 初始配置 (与 vmq.sql 中的 INSERT 完全一致)
 -- ============================================================
@@ -60,6 +75,7 @@ INSERT OR IGNORE INTO setting (vkey, vvalue) VALUES
     ('jkstate',   '-1'),
     ('close',     '5'),
     ('payQf',     '1'),
+    ('paylog',    '1'),
     ('wxpay',     ''),
     ('zfbpay',    '');
 

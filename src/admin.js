@@ -12,6 +12,7 @@ import {
   listPayQrcodes, insertPayQrcode, deletePayQrcode,
   listOrders, countOrdersByState, todayIncome,
   findOrderByOrderId, updateOrderState,
+  listPayLogs, clearPayLogs,
   getReturn
 } from './db.js';
 import { html, escape as e } from './templates.js';
@@ -128,6 +129,48 @@ export async function adminSettingPage(request, db) {
   });
 }
 
+// ----- 后台:收款日志 -----
+export async function adminPayLogPage(request, db) {
+  if (!(await checkAuth(request, db))) return redirectLogin();
+  const url = new URL(request.url);
+  const typeStr = url.searchParams.get('type');
+  const type = typeStr === '1' || typeStr === '2' ? Number(typeStr) : null;
+  const [r, paylog] = [await listPayLogs(db, { type, limit: 200 }), await getSetting(db, 'paylog')];
+  const rows = (r.results || []).map(row => ({
+    id: row.id,
+    create_date: formatTime(row.create_date),
+    type: row.type,
+    typeLabel: row.type === 1 ? '💚 微信' : row.type === 2 ? '💙 支付宝' : '?',
+    price: Number(row.price).toFixed(2),
+    app_id: row.app_id || '',
+    order_id: row.order_id || '',
+    isRetry: row.is_retry === 1,
+    try_count: row.try_count,
+    code: row.code,
+    msg: row.msg || ''
+  }));
+  return new Response(html('payLog', {
+    rows, filter: type === 1 ? '微信' : type === 2 ? '支付宝' : '',
+    enabled: String(paylog ?? '1') !== '0'
+  }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+export async function adminPayLogClear(request, db) {
+  if (!(await checkAuth(request, db))) return redirectLogin();
+  await clearPayLogs(db);
+  return new Response(null, { status: 302, headers: { 'Location': '/admin/paylog' } });
+}
+
+// ----- 后台:监控端扫码配置 -----
+export async function adminConfigQrPage(request, db) {
+  if (!(await checkAuth(request, db))) return redirectLogin();
+  const key = await getSetting(db, 'key');
+  const origin = new URL(request.url).origin;
+  return new Response(html('configQr', { origin, key: String(key || '') }), {
+    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  });
+}
+
 export async function adminSettingSave(request, db) {
   if (!(await checkAuth(request, db))) return redirectLogin();
   const fd = await request.formData().catch(() => new FormData());
@@ -135,7 +178,7 @@ export async function adminSettingSave(request, db) {
   // 接收所有字段,但只允许白名单内的 key (Vmqphp 直接覆盖所有 setting)
   const allowKeys = [
     'user', 'pass', 'key', 'notifyUrl', 'returnUrl',
-    'wxpay', 'zfbpay', 'close', 'payQf'
+    'wxpay', 'zfbpay', 'close', 'payQf', 'paylog'
   ];
   for (const k of allowKeys) {
     if (fd.has(k)) await setSetting(db, k, String(fd.get(k) || ''));

@@ -1,51 +1,64 @@
 @echo off
-chcp 65001 >nul
+@rem chcp 65001 >nul
 setlocal
 
 REM ============================================================
-REM è·‘æ ¸å¿ƒ API æµ‹è¯• (tests/test_api.mjs)
-REM - ä¸éœ€è¦ wrangler / è”ç½‘
-REM - ä»…éœ€ Node 18+ (Node 22+ è‡ªå¸¦ node:sqlite,æ¨è)
+REM PvPay ±¾µØ²âÊÔ (Óë npm test Ò»ÖÂ,4 ¸ö²âÊÔÎÄ¼ş)
+REM - ²»ĞèÒª wrangler / ÁªÍø
+REM - ĞèÒª Node 22+ (node:sqlite)
 REM ============================================================
 
 cd /d "%~dp0"
 
 echo ============================================
-echo   PvPay æœ¬åœ°æµ‹è¯•
+echo   PvPay ±¾µØ²âÊÔ
 echo ============================================
 echo.
 
 where node >nul 2>nul
 if errorlevel 1 (
-    echo [X] æœªæ£€æµ‹åˆ° Node.js
+    echo [X] Î´¼ì²âµ½ Node.js
     pause & exit /b 1
 )
-for /f "tokens=*" %%v in ('node -v') do echo [OK] Node ç‰ˆæœ¬:%%v
+for /f "tokens=*" %%v in ('node -v') do echo [OK] Node °æ±¾:%%v
 
-REM æ£€æŸ¥ Node ç‰ˆæœ¬ >=22 æ‰æ”¯æŒ node:sqlite
+REM ¼ì²é Node °æ±¾ >=22 ²ÅÖ§³Ö node:sqlite
 for /f "tokens=2 delims=v." %%m in ('node -v') do (
     if %%m lss 22 (
-        echo [!] å»ºè®® Node 22+ (å½“å‰ %%m),node:sqlite ä¸å¯ç”¨ä¼šæŠ¥é”™
+        echo [!] ½¨Òé Node 22+ (µ±Ç° %%m),node:sqlite ²»¿ÉÓÃ»á±¨´í
     )
 )
 
 echo.
-echo [1/2] MD5 è‡ªæµ‹ (9 æ¡ PHP md5 æ¯”å¯¹) ...
-echo.
+echo [1/5] MD5 ×Ô²â (9 Ìõ PHP md5 ±È¶Ô) ...
 node tests\test_md5.mjs
 if errorlevel 1 goto :fail
 
 echo.
-echo [2/2] æ ¸å¿ƒ API ç«¯åˆ°ç«¯ (30 ä¸ª) ...
-echo.
+echo [2/5] ºËĞÄ API ¶Ëµ½¶Ë ...
 node tests\test_api.mjs
 if errorlevel 1 goto :fail
 
 echo.
-echo [DONE] å…¨éƒ¨é€šè¿‡
+echo [3/5] altmanlib v1 HMAC JSON Ğ­Òé ...
+node tests\test_api_v1.mjs
+if errorlevel 1 goto :fail
+
+echo.
+echo [4/5] v2 HMAC-SHA256 ¼à¿Ø¶ËÇ©Ãû ...
+node tests\test_sign_v2.mjs
+if errorlevel 1 goto :fail
+
+echo.
+echo [5/5] ÊÕ¿îÈÕÖ¾ pay_log (¿ª¹Ø/²Ã¼ô) ...
+node tests\test_paylog.mjs
+if errorlevel 1 goto :fail
+
+echo.
+echo [DONE] È«²¿Í¨¹ı
 pause & exit /b 0
 
 :fail
 echo.
-echo [X] æµ‹è¯•æœ‰å¤±è´¥ç”¨ä¾‹
+echo [X] ²âÊÔÓĞÊ§°ÜÓÃÀı
 pause & exit /b 1

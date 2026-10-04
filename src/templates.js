@@ -3,6 +3,8 @@
 // 把所有页面放进一个文件,Workers 没有文件系统,模板必须为内嵌字符串
 // =============================================================================
 
+import { QRCODE_LIB } from './vendor_qrcode.js';
+
 // HTML 转义
 export function escape(s) {
   return String(s ?? '')
@@ -52,7 +54,9 @@ const NAV = (active) => `
 <div class="nav">
   <a href="/admin/" ${active==='home'?'class="active"':''}>📊 数据总览</a>
   <a href="/admin/order" ${active==='order'?'class="active"':''}>📋 订单管理</a>
+  <a href="/admin/paylog" ${active==='paylog'?'class="active"':''}>📒 收款日志</a>
   <a href="/admin/setting" ${active==='setting'?'class="active"':''}>⚙️ 系统设置</a>
+  <a href="/admin/configqr" ${active==='configqr'?'class="active"':''}>📲 客户端配置</a>
   <a href="/admin/qrcode?type=1" ${active==='wxqr'?'class="active"':''}>💚 微信二维码</a>
   <a href="/admin/qrcode?type=2" ${active==='zfbqr'?'class="active"':''}>💙 支付宝二维码</a>
   <a href="/admin/api" ${active==='api'?'class="active"':''}>🔌 API 说明</a>
@@ -135,6 +139,14 @@ function settingTpl({ settings }) {
   ${row('zfbpay', '默认支付宝收款码 (pay_url)', 'HTTPS://qr.alipay.com/xxx 形式')}
   ${row('close', '订单超时分钟 (close)', '超过此时间未支付的订单自动关闭,默认 5')}
   ${row('payQf', '金额冲突策略 (payQf)', '1=加 1 分避开冲突;2=减 1 分;其他=不调整')}
+  <div class="form-row">
+    <label>收款日志开关 (paylog)</label>
+    <select name="paylog">
+      <option value="1" ${String(s.paylog) === '0' ? '' : 'selected'}>开 — 记录每笔监控端到账推送</option>
+      <option value="0" ${String(s.paylog) === '0' ? ' selected' : ''}>关 — 不写入日志</option>
+    </select>
+    <div style="color:var(--muted);font-size:12px;margin-top:4px">日志在「收款日志」页查看,自动保留最近 1000 条</div>
+  </div>
   <div class="row">
     <button class="btn" type="submit">保存设置</button>
     <a class="btn gray" href="/admin/">返回</a>
@@ -252,6 +264,33 @@ sign = md5(payId + param + type + price + reallyPrice + key)</pre>
 <h3>⑦ 监控端状态查询 <code>GET /getState</code></h3>
 <pre>参数: t, sign=md5(t + key)
 返回 { lastheart, lastpay, jkstate }</pre>
+
+<h3>⑧ 路由别名(fork 客户端兼容)</h3>
+<pre>/api/monitor/heart = /appHeart   (xinyin025 / hulisang 客户端)
+/api/monitor/push  = /appPush    (同上)
+app_id 参数 (daojiAnime 多应用版客户端) 会被接受并记录日志,但不参与签名校验。</pre>
+
+<h3>⑧b v2 监控端签名 (hulisang Material You 版客户端)</h3>
+<pre>appHeart / appPush / 上述别名的 sign 支持两种格式,按长度自动识别:
+  32 位 hex → 旧版 md5(与 Vmqphp 完全一致)
+  64 位 hex → HMAC-SHA256(key, canonical),canonical:
+    心跳: "t=" + t          (t 为毫秒时间戳)
+    推送: "type=" + type + "&amp;price=" + price + "&amp;t=" + t
+  毫秒时间戳双向新鲜度校验,容差 ±300s,超窗拒绝。
+  price 文本必须与参与签名的文本完全一致(客户端 BigDecimal 定标两位)。</pre>
+
+<h3>⑨ HMAC 签名 JSON 协议 (altmanlib/vmq-apk Kotlin 客户端)</h3>
+<pre>POST /api/v1/system/heartbeat   body: {}
+POST /api/v1/payments/notify    body: {"channel":1|2,"price":12.34}
+
+请求头:
+  X-VMQ-Timestamp  秒级时间戳 (容差 ±300s)
+  X-VMQ-Nonce      UUID (防重放)
+  X-VMQ-Signature  v1=hex(HMAC-SHA256(key, canonical))
+canonical = "VMQ-HMAC-SHA256-V1\\n{METHOD}\\n{pathname}\\n{timestamp}\\n{nonce}\\n{sha256hex(body)}"
+
+校验失败 → 401;参数非法 → 400;服务端异常 → 500
+(客户端对 5xx 会指数退避重试,订单匹配按状态幂等,不会重复通知商户)。</pre>
 </div>`);
 }
 
@@ -302,6 +341,98 @@ function payPageTpl({ order }) {
 }
 
 // =========================================================================
+// PAY LOG (收款推送日志)
+// =========================================================================
+function payLogTpl({ rows, filter, enabled }) {
+  const r = (row) => `
+    <tr>
+      <td>${row.id}</td>
+      <td><span style="font-size:12px">${escape(row.create_date)}</span></td>
+      <td>${row.typeLabel}</td>
+      <td>¥${row.price}</td>
+      <td style="font-size:12px">${escape(row.app_id || '—')}</td>
+      <td><code style="font-size:12px">${escape(row.order_id || '—')}</code></td>
+      <td>${row.isRetry ? `<span class="badge yellow">重试 #${row.try_count}</span>` : '<span class="badge gray">首次</span>'}</td>
+      <td><span class="badge ${row.code === 1 ? 'green' : 'red'}">${escape(row.msg || (row.code === 1 ? '成功' : '失败'))}</span></td>
+    </tr>`;
+  return LAYOUT('收款日志', 'paylog', `
+<div class="card"><h2>📒 收款日志 (最新 ${rows.length} 条)</h2>
+  <p style="color:var(--muted);font-size:13px">
+    记录监控端每次到账推送 (微信/支付宝收款通知),含未匹配到订单的推送;
+    开关与保留策略见「系统设置」(自动保留最近 1000 条)。
+    当前状态: ${enabled ? '<span class="badge green">记录中</span>' : '<span class="badge red">已关闭</span>'}
+  </p>
+  <div class="row" style="margin-bottom:12px">
+    <a class="btn gray" href="/admin/paylog">全部</a>
+    <a class="btn gray" href="/admin/paylog?type=1">💚 微信</a>
+    <a class="btn gray" href="/admin/paylog?type=2">💙 支付宝</a>
+    <a class="btn danger" href="/admin/paylog/clear" style="margin-left:auto" onclick="return confirm('确认清空全部收款日志?')">清空</a>
+  </div>
+  <table>
+    <thead><tr><th>#</th><th>时间</th><th>类型</th><th>金额</th><th>app_id</th><th>匹配订单</th><th>推送</th><th>结果</th></tr></thead>
+    <tbody>${rows.length ? rows.map(r).join('') : `<tr><td colspan="8" style="text-align:center;color:var(--muted)">${enabled ? '暂无日志' : '日志当前已关闭,可在系统设置中开启'}</td></tr>`}</tbody>
+  </table>
+  <p style="color:var(--muted);font-size:12px;margin-top:10px">当前筛选: ${escape(filter || '全部')}</p>
+</div>`);
+}
+
+// =========================================================================
+// CONFIG QR (监控端扫码配置 — 客户端 MainActivity 解析 ^https?://host/key[/app_id]$)
+// =========================================================================
+function configQrTpl({ origin, key }) {
+  const base = `${origin}/${key}`;
+  const keyOk = !!key && !key.includes('/');
+  return LAYOUT('客户端配置', 'configqr', `
+<div class="card"><h2>📲 监控端配置二维码</h2>
+  <p style="color:var(--muted);font-size:13px">
+    手机 APP「V免签监控端」→「扫码配置」扫描此码;也可把下方配置字符串手动粘贴进 APP。
+    二维码内容为 <code>https://域名/key</code>，填写 app_id 后变为 <code>https://域名/key/app_id</code>（多监控端区分,服务端日志用）。
+  </p>
+  ${!key ? '<div class="error">尚未设置 key，请先到「系统设置」配置密钥再生成</div>' : ''}
+  ${key && !keyOk ? '<div class="error">key 中含有 "/"，会破坏客户端解析格式，请更换密钥</div>' : ''}
+  <div class="row" style="align-items:flex-start;gap:24px">
+    <div id="qrcode" style="background:#fff;padding:12px;border-radius:8px;min-width:200px;text-align:center">${keyOk ? '' : '<span style="color:#000">—</span>'}</div>
+    <div style="flex:1;min-width:280px">
+      <div class="form-row"><label>配置字符串（与二维码内容一致）</label>
+        <input id="cfgText" readonly value="${escape(base)}"></div>
+      <div class="form-row"><label>app_id（可选，只允许字母数字_-，留空则不带该段）</label>
+        <input id="appId" placeholder="留空即可，无需多端区分时"></div>
+      <div class="row"><button class="btn" onclick="copyCfg()">复制配置字符串</button></div>
+    </div>
+  </div>
+</div>
+${keyOk ? `<script>${QRCODE_LIB}</script>
+<script>
+(function () {
+  var textEl = document.getElementById('cfgText');
+  var appIdEl = document.getElementById('appId');
+  function render() {
+    var text = textEl.value;
+    var aid = appIdEl.value.trim().replace(/[^A-Za-z0-9_-]/g, '');
+    appIdEl.value = aid;
+    if (aid) text = text + '/' + aid;
+    var qr = qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    document.getElementById('qrcode').innerHTML =
+      qr.createSvgTag({ cellSize: 7, margin: 2, scalable: false });
+  }
+  appIdEl.addEventListener('input', render);
+  render();
+  window.copyCfg = function () {
+    textEl.select();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(textEl.value);
+    } else {
+      document.execCommand('copy');
+    }
+  };
+})();
+</script>` : ''}
+`);
+}
+
+// =========================================================================
 // ROUTER
 // =========================================================================
 export function html(page, data) {
@@ -311,6 +442,8 @@ export function html(page, data) {
     case 'setting': return settingTpl(data);
     case 'order': return orderTpl(data);
     case 'qrcode': return qrcodeTpl(data);
+    case 'payLog': return payLogTpl(data);
+    case 'configQr': return configQrTpl(data);
     case 'api': return apiTpl();
     case 'payPage': return payPageTpl(data);
     default: return `<h1>Unknown template: ${escape(page)}</h1>`;

@@ -220,3 +220,34 @@ export async function insertPayQrcode(db, { pay_url, price, type }) {
 export async function deletePayQrcode(db, id) {
   return db.prepare('DELETE FROM pay_qrcode WHERE id = ?').bind(id).run();
 }
+
+// ---------- pay_log (收款推送日志,setting.paylog 开关控制是否写入) ----------
+const PAY_LOG_KEEP = 1000;
+
+export async function recordPayLog(db, {
+  type, price, appId = '', isRetry = false, tryCount = 1,
+  orderId = '', code = 0, msg = ''
+}) {
+  const now = Math.floor(Date.now() / 1000);
+  await db.prepare(
+    `INSERT INTO pay_log (create_date, type, price, app_id, is_retry, try_count, order_id, code, msg)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(now, Number(type), Number(price), String(appId || ''),
+         isRetry ? 1 : 0, Number(tryCount) || 1, String(orderId || ''),
+         Number(code), String(msg || '')).run();
+  // 裁剪:只保留最近 PAY_LOG_KEEP 条,避免 D1 无限膨胀
+  await db.prepare('DELETE FROM pay_log WHERE id <= (SELECT MAX(id) - ? FROM pay_log)')
+           .bind(PAY_LOG_KEEP).run();
+}
+
+export async function listPayLogs(db, { type = null, limit = 200 } = {}) {
+  if (type === null) {
+    return db.prepare('SELECT * FROM pay_log ORDER BY id DESC LIMIT ?').bind(limit).all();
+  }
+  return db.prepare('SELECT * FROM pay_log WHERE type = ? ORDER BY id DESC LIMIT ?')
+           .bind(Number(type), limit).all();
+}
+
+export async function clearPayLogs(db) {
+  return db.prepare('DELETE FROM pay_log').run();
+}

@@ -12,9 +12,12 @@ import {
   appHeart, appPush, _closeEndOrder
 } from './api.js';
 
+import { apiHeartbeat, apiNotify } from './api_v1.js';
+
 import {
   adminLoginPage, adminLogin, adminLogout, adminHome,
-  adminSettingPage, adminSettingSave,
+  adminSettingPage, adminSettingSave, adminConfigQrPage,
+  adminPayLogPage, adminPayLogClear,
   adminOrderList, adminPatchOrder, adminResendNotify,
   adminQrcodePage, adminQrcodeAdd, adminQrcodeDelete,
   adminApiPage
@@ -48,11 +51,18 @@ export default {
       if (path === '/getState' || path === '/index/getState') {
         return await getState(request, db);
       }
-      if (path === '/appHeart' || path === '/index/appHeart') {
+      if (path === '/appHeart' || path === '/index/appHeart' || path === '/api/monitor/heart') {
         return await appHeart(request, db);
       }
-      if (path === '/appPush' || path === '/index/appPush') {
+      if (path === '/appPush' || path === '/index/appPush' || path === '/api/monitor/push') {
         return await appPush(request, db);
+      }
+      // altmanlib/vmq-apk (Kotlin 重写版) 的 HMAC 签名 JSON 协议
+      if (path === '/api/v1/system/heartbeat') {
+        return await apiHeartbeat(request, db);
+      }
+      if (path === '/api/v1/payments/notify') {
+        return await apiNotify(request, db);
       }
       if (path === '/closeEndOrder' || path === '/index/closeEndOrder') {
         const n = await _closeEndOrder(db);
@@ -91,6 +101,9 @@ export default {
       if (path === '/admin/logout') return await adminLogout();
 
       if (path === '/admin/setting' && request.method === 'GET')  return await adminSettingPage(request, db);
+      if (path === '/admin/configqr' && request.method === 'GET') return await adminConfigQrPage(request, db);
+      if (path === '/admin/paylog' && request.method === 'GET') return await adminPayLogPage(request, db);
+      if (path === '/admin/paylog/clear') return await adminPayLogClear(request, db);
       if (path === '/admin/setting/save') return await adminSettingSave(request, db);
 
       if (path === '/admin/order') return await adminOrderList(request, db);
