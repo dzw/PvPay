@@ -1,0 +1,20 @@
+{
+  "name": "pvpay",
+  "version": "1.0.0",
+  "description": "Cloudflare Workers 版 V免签 — 复刻自 szvone/Vmqphp",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute pvpay-db --file=./schema.sql",
+    "db:init:remote": "wrangler d1 execute pvpay-db --file=./schema.sql --remote",
+    "db:tail": "wrangler tail",
+    "test": "node tests/test_api.mjs && node tests/test_md5.mjs"
+  },
+  "keywords": ["vmq", "payment", "cloudflare-workers", "d1"],
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

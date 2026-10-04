@@ -1,0 +1,21 @@
+name = "pvpay"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 数据库绑定 — 替换 database_id 为你 wrangler d1 create 返回的值
+[[d1_databases]]
+binding = "DB"
+database_name = "pvpay-db"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+# 定时触发器:每分钟清理一次过期订单 (可选,Workers Cron Trigger)
+# [triggers]
+# crons = ["* * * * *"]
+#
+# 如启用定时触发器,需要在 Cloudflare Dashboard 给 Worker 启用 Cron Triggers
+# (Workers → Settings → Triggers → Add Cron Trigger → "0 * * * * *" = 每分钟)
+
+[vars]
+# 自定义环境变量可放这里,代码里通过 env.XXX 访问
+# SITE_NAME = "PvPay"
